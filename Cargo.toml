@@ -1,0 +1,24 @@
+[package]
+name = "ax25ms-rust"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-std = "1.12.0"
+log = "0.4.18"
+mpsc = "0.1.0"
+prost = "0.11.9"
+stderrlog = "0.5.4"
+structopt = "0.3.26"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+tokio-stream = "0.1.14"
+tonic = "0.9.2"
+
+[build-dependencies]
+tonic-build = "0.9"
+
+[[bin]]
+name = "udp-bridge"
+path = "src/bin/udpbridge.rs"
