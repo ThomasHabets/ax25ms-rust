@@ -1,6 +1,6 @@
 use futures::FutureExt;
 use futures::{pin_mut, select};
-use log::info;
+use log::{error, info};
 use structopt::StructOpt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -31,7 +31,7 @@ struct Opt {
 #[derive(Debug)]
 enum MyError {
     RPCError(tonic::transport::Error),
-    RPCStatusError(tonic::Status),
+    RPCStatus(tonic::Status),
     IOError(std::io::Error),
     AddrParseError(std::net::AddrParseError),
     StreamError(Box<dyn std::error::Error>),
@@ -48,7 +48,7 @@ impl From<tonic::transport::Error> for MyError {
 }
 impl From<tonic::Status> for MyError {
     fn from(error: tonic::Status) -> Self {
-        MyError::RPCStatusError(error)
+        MyError::RPCStatus(error)
     }
 }
 impl From<std::io::Error> for MyError {
@@ -65,14 +65,20 @@ impl From<std::net::AddrParseError> for MyError {
 struct MyServer {
     sockregger: mpsc::Sender<mpsc::Sender<Result<ax25ms::Frame, tonic::Status>>>,
     dst: String,
+    sock: tokio::net::UdpSocket,
 }
 
 impl MyServer {
-    fn new(
+    async fn new(
         sockregger: mpsc::Sender<mpsc::Sender<Result<ax25ms::Frame, tonic::Status>>>,
         dst: String,
-    ) -> MyServer {
-        MyServer { sockregger, dst }
+    ) -> Result<MyServer, MyError> {
+        let sock = tokio::net::UdpSocket::bind("[::]:0").await?;
+        Ok(MyServer {
+            sockregger,
+            dst,
+            sock,
+        })
     }
 }
 
@@ -88,7 +94,7 @@ impl ax25ms::router_service_server::RouterService for MyServer {
         self.sockregger
             .send(tx)
             .await
-            .expect("failed to register streamer");
+            .map_err(|e| tonic::Status::internal(format!("Failed to register streamer: {}", e)))?;
         Ok(tonic::Response::new(ReceiverStream::new(rx)))
     }
     async fn send(
@@ -96,19 +102,29 @@ impl ax25ms::router_service_server::RouterService for MyServer {
         request: tonic::Request<ax25ms::SendRequest>,
     ) -> std::result::Result<tonic::Response<ax25ms::SendResponse>, tonic::Status> {
         info!("Packet from router to UDP (uplink)");
-        let sock = tokio::net::UdpSocket::bind("[::]:0").await.unwrap(); // TODO: move to self
-        sock.send_to(&request.into_inner().frame.unwrap().payload, &self.dst)
+        let frame = request
+            .into_inner()
+            .frame
+            .ok_or_else(|| tonic::Status::failed_precondition("frame missing"))?;
+        self.sock
+            .send_to(&frame.payload, &self.dst)
             .await
-            .unwrap();
+            .map_err(|e| tonic::Status::unavailable(format!("failed to send UDP packet: {}", e)))?;
         Ok(tonic::Response::new(ax25ms::SendResponse {}))
     }
 }
 
 async fn read_udp_packet(sock: &tokio::net::UdpSocket) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.resize(10000, 0);
-    let (n, _addr) = sock.recv_from(&mut buf).await.unwrap();
-    buf[0..n].to_vec()
+    loop {
+        let mut buf = Vec::new();
+        buf.resize(10000, 0);
+        match sock.recv_from(&mut buf).await {
+            Ok((n, _addr)) => return buf[0..n].to_vec(),
+            Err(e) => {
+                error!("Error reading UDP packet: {}", e);
+            }
+        };
+    }
 }
 
 async fn udp_server(
@@ -122,8 +138,11 @@ async fn udp_server(
 
         pin_mut!(regger_fut, sock_fut);
         select! {
-            r = regger_fut => {
-                regged.push(r.unwrap());
+            r = regger_fut => match r {
+                Some(r) => regged.push(r),
+                None => {
+                    error!("Failed to receive on regger port");
+                },
             },
             buf = sock_fut  => {
                 let frame = ax25ms::Frame {
@@ -133,13 +152,16 @@ async fn udp_server(
                     "Packet from UDP to router (downlink), {} listeners",
                     regged.len()
                 );
-                let mut remove = Vec::new();
-                for n in 1..regged.len() {
-                    regged[n].send(Ok(frame.clone())).await.unwrap_or_else(|_|{
-                        info!("Client disconnected");
-                        remove.push(n);
-                    });
-                }
+                let remove = {
+                    let mut ret = Vec::new();
+                    for (n, r) in regged.iter().enumerate() {
+                        r.send(Ok(frame.clone())).await.unwrap_or_else(|_|{
+                            info!("Client disconnected");
+                            ret.push(n);
+                        });
+                    }
+                    ret
+                };
                 for n in remove.iter().rev() {
                     regged.remove(*n);
                 }
@@ -158,11 +180,14 @@ async fn main() -> Result<(), MyError> {
         .verbosity(3)
         .timestamp(stderrlog::Timestamp::Second)
         .init()
-        .unwrap();
+        .expect("Failed to initialize logger");
+
     // Start UDP -> RPC client.
     let (sockregger, rx) = mpsc::channel(4);
     {
-        let sock = tokio::net::UdpSocket::bind(&opt.listen).await.unwrap();
+        let sock = tokio::net::UdpSocket::bind(&opt.listen)
+            .await
+            .expect("Failed to bind to UDP socket");
         tokio::spawn(async move {
             udp_server(sock, rx).await;
         });
@@ -170,13 +195,17 @@ async fn main() -> Result<(), MyError> {
 
     info!("Running…");
     {
-        let addr = opt.router_listen.parse().unwrap();
-        let srv = MyServer::new(sockregger, opt.dst.clone());
+        let addr = opt.router_listen.parse().unwrap_or_else(|e| {
+            panic!(
+                "Failed to parse {} as listen address: {}",
+                opt.router_listen, e
+            )
+        });
+        let srv = MyServer::new(sockregger, opt.dst.clone()).await?;
         tonic::transport::Server::builder()
             .add_service(ax25ms::router_service_server::RouterServiceServer::new(srv))
             .serve(addr)
-            .await
-            .unwrap();
+            .await?
     }
     info!("Ending");
     Ok(())
