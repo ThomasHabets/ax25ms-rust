@@ -20,16 +20,13 @@ pub mod aprs {
 #[derive(StructOpt, Debug)]
 #[structopt()]
 struct Opt {
-    #[structopt(short = "r", long = "router")]
-    router: String,
-
     #[structopt(short = "u", long = "udp-dest")]
     dst: String,
 
     #[structopt(short = "l", long = "udp-listen")]
     listen: String,
 
-    #[structopt(short = "l", long = "router-listen")]
+    #[structopt(short = "L", long = "router-listen")]
     router_listen: String,
 }
 
@@ -68,18 +65,21 @@ impl From<std::net::AddrParseError> for MyError {
 }
 
 struct MyServer {
-    client: Arc<Mutex<RouterServiceClient<tonic::transport::Channel>>>,
+    //client: Arc<Mutex<RouterServiceClient<tonic::transport::Channel>>>,
     sockregger: mpsc::Sender<mpsc::Sender<Result<ax25ms::Frame, tonic::Status>>>,
+    dst: String,
 }
 
 impl MyServer {
     fn new(
-        client: RouterServiceClient<tonic::transport::Channel>,
+        //client: RouterServiceClient<tonic::transport::Channel>,
         sockregger: mpsc::Sender<mpsc::Sender<Result<ax25ms::Frame, tonic::Status>>>,
+        dst: String,
     ) -> MyServer {
         MyServer {
-            client: Arc::new(Mutex::new(client)),
+            //client: Arc::new(Mutex::new(client)),
             sockregger,
+            dst,
         }
     }
 }
@@ -94,20 +94,30 @@ impl ax25ms::router_service_server::RouterService for MyServer {
         _request: tonic::Request<ax25ms::StreamRequest>,
     ) -> std::result::Result<tonic::Response<Self::StreamFramesStream>, tonic::Status> {
         let (tx, rx) = mpsc::channel(4);
-        self.sockregger.send(tx).await.unwrap();
+        self.sockregger
+            .send(tx)
+            .await
+            .expect("failed to register streamer");
         Ok(tonic::Response::new(ReceiverStream::new(rx)))
     }
     async fn send(
         &self,
         request: tonic::Request<ax25ms::SendRequest>,
     ) -> std::result::Result<tonic::Response<ax25ms::SendResponse>, tonic::Status> {
-        self.client
-            .lock()
+        info!("Packet from router to UDP (uplink)");
+        let sock = tokio::net::UdpSocket::bind("[::]:0").await.unwrap(); // TODO: move to self
+        sock.send_to(&request.into_inner().frame.unwrap().payload, &self.dst)
             .await
-            .send(tonic::Request::new(ax25ms::SendRequest {
-                frame: request.into_inner().frame,
-            }))
-            .await?;
+            .unwrap();
+        /*
+                self.client
+                    .lock()
+                    .await
+                    .send(tonic::Request::new(ax25ms::SendRequest {
+                        frame: request.into_inner().frame,
+                    }))
+                    .await?;
+        */
         Ok(tonic::Response::new(ax25ms::SendResponse {}))
     }
 }
@@ -126,7 +136,10 @@ async fn udp_server(
         let frame = ax25ms::Frame {
             payload: buf[0..n].to_vec(),
         };
-        info!("Packet from UDP to router (downlink)");
+        info!(
+            "Packet from UDP to router (downlink), {} listeners",
+            regged.len()
+        );
         // TODO: remove the clients that have disconnected.
         for tx in &regged {
             tx.send(Ok(frame.clone())).await.unwrap();
@@ -145,24 +158,25 @@ async fn main() -> Result<(), MyError> {
         .timestamp(stderrlog::Timestamp::Second)
         .init()
         .unwrap();
-
     // Start UDP -> RPC client.
     let (sockregger, rx) = mpsc::channel(4);
     {
-        let sock = tokio::net::UdpSocket::bind(&opt.listen).await?;
+        let sock = tokio::net::UdpSocket::bind(&opt.listen).await.unwrap();
         tokio::spawn(async move {
             udp_server(sock, rx).await;
         });
     }
 
+    info!("Running…");
     {
-        let addr = opt.router_listen.parse()?;
-        let client = RouterServiceClient::connect(opt.router.clone()).await?;
-        let srv = MyServer::new(client, sockregger);
+        let addr = opt.router_listen.parse().unwrap();
+        //let client = RouterServiceClient::connect(opt.router.clone()).await?;
+        let srv = MyServer::new(sockregger, opt.dst.clone());
         tonic::transport::Server::builder()
             .add_service(ax25ms::router_service_server::RouterServiceServer::new(srv))
             .serve(addr)
-            .await?;
+            .await
+            .unwrap();
     }
     /*
         tokio::spawn(async move {
@@ -180,7 +194,7 @@ async fn main() -> Result<(), MyError> {
             }
         });
     */
-
+    /*
     let sock = tokio::net::UdpSocket::bind("[::]:0").await?;
 
     // Start router->UDP.
@@ -195,4 +209,7 @@ async fn main() -> Result<(), MyError> {
         info!("Packet from router to UDP (uplink)");
         sock.send_to(&frame, &opt.dst).await?;
     }
+     */
+    info!("Ending");
+    Ok(())
 }
