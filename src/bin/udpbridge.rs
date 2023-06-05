@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use anyhow::Result;
 use futures::FutureExt;
 use futures::{pin_mut, select};
 use log::{error, info};
@@ -43,40 +44,6 @@ struct Opt {
     router_listen: String,
 }
 
-#[derive(Debug)]
-enum MyError {
-    RPCError(tonic::transport::Error),
-    RPCStatus(tonic::Status),
-    IOError(std::io::Error),
-    AddrParseError(std::net::AddrParseError),
-    StreamError(Box<dyn std::error::Error>),
-}
-impl From<Box<dyn std::error::Error>> for MyError {
-    fn from(error: Box<dyn std::error::Error>) -> Self {
-        MyError::StreamError(error)
-    }
-}
-impl From<tonic::transport::Error> for MyError {
-    fn from(error: tonic::transport::Error) -> Self {
-        MyError::RPCError(error)
-    }
-}
-impl From<tonic::Status> for MyError {
-    fn from(error: tonic::Status) -> Self {
-        MyError::RPCStatus(error)
-    }
-}
-impl From<std::io::Error> for MyError {
-    fn from(error: std::io::Error) -> Self {
-        MyError::IOError(error)
-    }
-}
-impl From<std::net::AddrParseError> for MyError {
-    fn from(error: std::net::AddrParseError) -> Self {
-        MyError::AddrParseError(error)
-    }
-}
-
 struct MyServer {
     sockregger: mpsc::Sender<mpsc::Sender<Result<ax25ms::Frame, tonic::Status>>>,
     dst: String,
@@ -87,7 +54,7 @@ impl MyServer {
     async fn new(
         sockregger: mpsc::Sender<mpsc::Sender<Result<ax25ms::Frame, tonic::Status>>>,
         dst: String,
-    ) -> Result<MyServer, MyError> {
+    ) -> Result<MyServer> {
         let sock = tokio::net::UdpSocket::bind("[::]:0").await?;
         Ok(MyServer {
             sockregger,
@@ -186,7 +153,7 @@ async fn udp_server(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), MyError> {
+async fn main() -> Result<()> {
     let opt = Opt::from_args();
 
     stderrlog::new()
