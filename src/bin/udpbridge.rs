@@ -1,11 +1,9 @@
-use async_std::sync::Mutex;
-use ax25ms::router_service_client::RouterServiceClient;
+use futures::FutureExt;
+use futures::{pin_mut, select};
 use log::info;
-use std::sync::Arc;
 use structopt::StructOpt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::StreamExt;
 
 pub mod ax25ms {
     tonic::include_proto!("ax25ms");
@@ -122,27 +120,40 @@ impl ax25ms::router_service_server::RouterService for MyServer {
     }
 }
 
-async fn udp_server(
-    sock: tokio::net::UdpSocket,
-    mut rx: mpsc::Receiver<mpsc::Sender<Result<ax25ms::Frame, tonic::Status>>>,
-) {
-    let mut regged = Vec::new();
-    regged.push(rx.recv().await.unwrap());
-
+async fn read_udp_packet(sock: &tokio::net::UdpSocket) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.resize(10000, 0);
+    let (n, _addr) = sock.recv_from(&mut buf).await.unwrap();
+    buf[0..n].to_vec()
+}
+
+async fn udp_server(
+    sock: tokio::net::UdpSocket,
+    mut regger: mpsc::Receiver<mpsc::Sender<Result<ax25ms::Frame, tonic::Status>>>,
+) {
+    let mut regged = Vec::new();
     loop {
-        let (n, _addr) = sock.recv_from(&mut buf).await.unwrap();
-        let frame = ax25ms::Frame {
-            payload: buf[0..n].to_vec(),
-        };
-        info!(
-            "Packet from UDP to router (downlink), {} listeners",
-            regged.len()
-        );
-        // TODO: remove the clients that have disconnected.
-        for tx in &regged {
-            tx.send(Ok(frame.clone())).await.unwrap();
+        let regger_fut = regger.recv().fuse();
+        let sock_fut = read_udp_packet(&sock).fuse();
+
+        pin_mut!(regger_fut, sock_fut);
+        select! {
+            r = regger_fut => {
+                regged.push(r.unwrap());
+            },
+            buf = sock_fut  => {
+                let frame = ax25ms::Frame {
+                    payload: buf.to_vec(),
+                };
+                info!(
+                    "Packet from UDP to router (downlink), {} listeners",
+                    regged.len()
+                );
+                // TODO: remove the clients that have disconnected.
+                for tx in &regged {
+                    tx.send(Ok(frame.clone())).await.unwrap();
+                }
+            }
         }
     }
 }
@@ -170,7 +181,6 @@ async fn main() -> Result<(), MyError> {
     info!("Running…");
     {
         let addr = opt.router_listen.parse().unwrap();
-        //let client = RouterServiceClient::connect(opt.router.clone()).await?;
         let srv = MyServer::new(sockregger, opt.dst.clone());
         tonic::transport::Server::builder()
             .add_service(ax25ms::router_service_server::RouterServiceServer::new(srv))
@@ -178,38 +188,6 @@ async fn main() -> Result<(), MyError> {
             .await
             .unwrap();
     }
-    /*
-        tokio::spawn(async move {
-            let mut buf = Vec::new();
-            buf.resize(10000, 0);
-            loop {
-            let (n, addr) = sock.recv_from(&mut buf).await.unwrap();
-            let req = tonic::Request::new(ax25ms::SendRequest {
-                frame: Some(ax25ms::Frame {
-                    payload: buf[0..n].to_vec(),
-                }),
-            });
-            info!("Packet from UDP to router");
-                client.send(req).await.unwrap();
-            }
-        });
-    */
-    /*
-    let sock = tokio::net::UdpSocket::bind("[::]:0").await?;
-
-    // Start router->UDP.
-    let mut stream_client = RouterServiceClient::connect(opt.router.clone()).await?;
-    info!("Running…");
-    let mut stream = stream_client
-        .stream_frames(ax25ms::StreamRequest {})
-        .await?
-        .into_inner();
-    loop {
-        let frame = stream.next().await.unwrap().unwrap().payload;
-        info!("Packet from router to UDP (uplink)");
-        sock.send_to(&frame, &opt.dst).await?;
-    }
-     */
     info!("Ending");
     Ok(())
 }

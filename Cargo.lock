@@ -172,6 +172,8 @@ name = "ax25ms-rust"
 version = "0.1.0"
 dependencies = [
  "async-std",
+ "futures",
+ "futures-util",
  "log",
  "mpsc",
  "prost",
