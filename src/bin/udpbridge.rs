@@ -63,28 +63,21 @@ impl From<std::net::AddrParseError> for MyError {
 }
 
 struct MyServer {
-    //client: Arc<Mutex<RouterServiceClient<tonic::transport::Channel>>>,
     sockregger: mpsc::Sender<mpsc::Sender<Result<ax25ms::Frame, tonic::Status>>>,
     dst: String,
 }
 
 impl MyServer {
     fn new(
-        //client: RouterServiceClient<tonic::transport::Channel>,
         sockregger: mpsc::Sender<mpsc::Sender<Result<ax25ms::Frame, tonic::Status>>>,
         dst: String,
     ) -> MyServer {
-        MyServer {
-            //client: Arc::new(Mutex::new(client)),
-            sockregger,
-            dst,
-        }
+        MyServer { sockregger, dst }
     }
 }
 
 #[tonic::async_trait]
 impl ax25ms::router_service_server::RouterService for MyServer {
-    //type StreamFramesStream = tonic::Streaming<ax25ms::Frame>;
     type StreamFramesStream = ReceiverStream<Result<ax25ms::Frame, tonic::Status>>;
 
     async fn stream_frames(
@@ -107,15 +100,6 @@ impl ax25ms::router_service_server::RouterService for MyServer {
         sock.send_to(&request.into_inner().frame.unwrap().payload, &self.dst)
             .await
             .unwrap();
-        /*
-                self.client
-                    .lock()
-                    .await
-                    .send(tonic::Request::new(ax25ms::SendRequest {
-                        frame: request.into_inner().frame,
-                    }))
-                    .await?;
-        */
         Ok(tonic::Response::new(ax25ms::SendResponse {}))
     }
 }
@@ -149,9 +133,15 @@ async fn udp_server(
                     "Packet from UDP to router (downlink), {} listeners",
                     regged.len()
                 );
-                // TODO: remove the clients that have disconnected.
-                for tx in &regged {
-                    tx.send(Ok(frame.clone())).await.unwrap();
+                let mut remove = Vec::new();
+                for n in 1..regged.len() {
+                    regged[n].send(Ok(frame.clone())).await.unwrap_or_else(|_|{
+                        info!("Client disconnected");
+                        remove.push(n);
+                    });
+                }
+                for n in remove.iter().rev() {
+                    regged.remove(*n);
                 }
             }
         }
