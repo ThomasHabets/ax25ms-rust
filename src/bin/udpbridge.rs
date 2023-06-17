@@ -169,7 +169,7 @@ async fn main() -> Result<()> {
     {
         let sock = tokio::net::UdpSocket::bind(&opt.listen)
             .await
-            .expect("Failed to bind to UDP socket");
+            .expect(format!("Failed to bind to UDP socket {}", &opt.listen).as_str());
         tokio::spawn(async move {
             udp_server(sock, rx).await;
         });
